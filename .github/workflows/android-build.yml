@@ -1,0 +1,77 @@
+name: 🚀 Android CI/CD Build
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Debug APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: ⬇️ Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: ☕ Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: 📦 Cache Gradle Packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: 🔧 Install Gradle 8.6
+        run: |
+          wget -q https://services.gradle.org/distributions/gradle-8.6-bin.zip -O gradle.zip
+          unzip -q gradle.zip -d /opt/gradle
+          echo "/opt/gradle/gradle-8.6/bin" >> $GITHUB_PATH
+          echo "✅ Gradle 8.6 installed"
+
+      - name: 🔨 Generate Gradle Wrapper
+        run: |
+          gradle wrapper --gradle-version=8.6 --distribution-type=bin
+          chmod +x gradlew
+          echo "✅ Wrapper generated"
+
+      - name: 📱 Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: 🏗️ Build Debug APK
+        run: |
+          ./gradlew assembleDebug \
+            --no-daemon \
+            --stacktrace \
+            -Dorg.gradle.jvmargs="-Xmx2g -XX:+HeapDumpOnOutOfMemoryError"
+
+      - name: ✅ Verify APK exists
+        run: |
+          ls -lh app/build/outputs/apk/debug/
+          echo "✅ APK build successful!"
+
+      - name: 📤 Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CoordExtractor-debug-${{ github.run_number }}
+          path: app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 30
+
+      - name: 📊 Build Summary
+        run: |
+          echo "### 🎉 Build Successful!" >> $GITHUB_STEP_SUMMARY
+          echo "- **App:** CoordExtractor" >> $GITHUB_STEP_SUMMARY
+          echo "- **Build:** Debug APK" >> $GITHUB_STEP_SUMMARY
+          echo "- **Run:** #${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
+          APK_SIZE=$(du -h app/build/outputs/apk/debug/app-debug.apk | cut -f1)
+          echo "- **APK Size:** $APK_SIZE" >> $GITHUB_STEP_SUMMARY

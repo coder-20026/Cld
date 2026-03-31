@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <dimen name="card_corner_radius">20dp</dimen>
+    <dimen name="card_padding">20dp</dimen>
+    <dimen name="page_margin">20dp</dimen>
+    <dimen name="fab_size">56dp</dimen>
+    <dimen name="icon_container_size">52dp</dimen>
+    <dimen name="icon_container_corner">14dp</dimen>
+    <dimen name="status_dot_size">12dp</dimen>
+</resources>
