@@ -24,71 +24,88 @@ import com.coordextractor.processing.ImageProcessor
 import kotlinx.coroutines.*
 
 /**
- * FloatingService — Foreground service jo floating button + result card manage karta hai.
+ * FloatingService — Two-phase start (Android 14 fix)
  *
- * Architecture:
- * - WindowManager pe 2 overlay views: floating button + result card
- * - MediaProjection se screen capture
- * - Coroutines se async processing (no UI block)
- * - Single-shot + Real-time mode dono support
+ * Phase 1 (ACTION_START_ONLY):
+ *   startForeground() immediately — no MediaProjection yet
+ *   Floating button appears, shows "waiting" state
+ *
+ * Phase 2 (ACTION_SET_PROJECTION):
+ *   Receives MediaProjection token from MainActivity
+ *   CaptureManager initialized — button becomes active
  */
 class FloatingService : Service() {
 
-    // ─── Companion Object ─────────────────────────────────────────────────────
-
     companion object {
-        const val EXTRA_RESULT_CODE = "extra_result_code"
+        const val ACTION_START_ONLY    = "action_start_only"
+        const val ACTION_SET_PROJECTION = "action_set_projection"
+        const val EXTRA_RESULT_CODE    = "extra_result_code"
         const val EXTRA_PROJECTION_DATA = "extra_projection_data"
-        const val CHANNEL_ID = "coord_extractor_overlay"
-        const val NOTIFICATION_ID = 7001
+        const val CHANNEL_ID           = "coord_extractor_overlay"
+        const val NOTIFICATION_ID      = 7001
 
-        @Volatile var isRunning = false
-        @Volatile var isRealtimeMode = false
+        @Volatile var isRunning       = false
+        @Volatile var isRealtimeMode  = false
     }
 
-    // ─── Properties ───────────────────────────────────────────────────────────
-
+    // ── Views ─────────────────────────────────────────────────────────────────
     private lateinit var windowManager: WindowManager
     private lateinit var floatingBinding: OverlayFloatingButtonBinding
     private var resultBinding: OverlayResultCardBinding? = null
 
+    // ── Core ──────────────────────────────────────────────────────────────────
     private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private var captureManager: CaptureManager? = null
     private val ocrRepository = OCRRepository()
     private val imageProcessor = ImageProcessor()
     private var realtimeJob: Job? = null
     private var lastCoordResult = ""
+    private var projectionReady = false
 
-    // Touch state
-    private var initialX = 0
-    private var initialY = 0
-    private var initialTouchX = 0f
-    private var initialTouchY = 0f
+    // ── Touch tracking ────────────────────────────────────────────────────────
+    private var initX = 0; private var initY = 0
+    private var initTX = 0f; private var initTY = 0f
     private var isDragging = false
-    private val longPressHandler = Handler(Looper.getMainLooper())
-    private var longPressRunnable: Runnable? = null
+    private val lpHandler = Handler(Looper.getMainLooper())
+    private var lpRunnable: Runnable? = null
 
-    // ─── Lifecycle ────────────────────────────────────────────────────────────
-
+    // ── Lifecycle ─────────────────────────────────────────────────────────────
     override fun onCreate() {
         super.onCreate()
         isRunning = true
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         createNotificationChannel()
+        // CRITICAL: startForeground IMMEDIATELY in onCreate — before any delay
         startForeground(NOTIFICATION_ID, buildNotification())
         setupFloatingButton()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        intent?.let {
-            val resultCode = it.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
-            @Suppress("DEPRECATION")
-            val projData = it.getParcelableExtra<Intent>(EXTRA_PROJECTION_DATA)
+        when (intent?.action) {
 
-            if (resultCode != Activity.RESULT_CANCELED && projData != null) {
-                val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-                val proj = mgr.getMediaProjection(resultCode, projData)
-                captureManager = CaptureManager(this, proj)
+            ACTION_START_ONLY -> {
+                // Phase 1: just started foreground — waiting for projection
+                projectionReady = false
+                setButtonEnabled(false)   // grey out until projection arrives
+            }
+
+            ACTION_SET_PROJECTION -> {
+                // Phase 2: projection token received — initialize capture
+                val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
+                @Suppress("DEPRECATION")
+                val projData = intent.getParcelableExtra<Intent>(EXTRA_PROJECTION_DATA)
+
+                if (resultCode != Activity.RESULT_CANCELED && projData != null) {
+                    try {
+                        val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                        val proj = mgr.getMediaProjection(resultCode, projData)
+                        captureManager = CaptureManager(this, proj)
+                        projectionReady = true
+                        setButtonEnabled(true)   // now active!
+                    } catch (e: Exception) {
+                        showToast("Capture setup failed: ${e.message}")
+                    }
+                }
             }
         }
         return START_NOT_STICKY
@@ -96,195 +113,149 @@ class FloatingService : Service() {
 
     override fun onDestroy() {
         isRunning = false
+        projectionReady = false
         serviceScope.cancel()
         realtimeJob?.cancel()
         captureManager?.release()
         ocrRepository.close()
         removeResultCard()
-        if (::floatingBinding.isInitialized) {
-            runCatching { windowManager.removeView(floatingBinding.root) }
-        }
+        runCatching { windowManager.removeView(floatingBinding.root) }
         super.onDestroy()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    // ─── Floating Button Setup ─────────────────────────────────────────────────
-
+    // ── Floating Button ───────────────────────────────────────────────────────
     private fun setupFloatingButton() {
         floatingBinding = OverlayFloatingButtonBinding.inflate(LayoutInflater.from(this))
-
-        val params = buildFloatingParams(100, 400)
+        val params = makeFloatingParams(80, 400)
         windowManager.addView(floatingBinding.root, params)
-        setupTouchListener(params)
+        setupTouch(params)
 
         // Entrance animation
         floatingBinding.root.apply {
             scaleX = 0f; scaleY = 0f; alpha = 0f
             animate().scaleX(1f).scaleY(1f).alpha(1f)
-                .setDuration(350)
-                .setInterpolator(OvershootInterpolator(1.5f))
-                .start()
+                .setDuration(350).setInterpolator(OvershootInterpolator(1.5f)).start()
         }
     }
 
-    private fun buildFloatingParams(x: Int, y: Int) = WindowManager.LayoutParams(
+    private fun makeFloatingParams(x: Int, y: Int) = WindowManager.LayoutParams(
         WindowManager.LayoutParams.WRAP_CONTENT,
         WindowManager.LayoutParams.WRAP_CONTENT,
         WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
         WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
         PixelFormat.TRANSLUCENT
-    ).apply {
-        gravity = Gravity.TOP or Gravity.START
-        this.x = x; this.y = y
-    }
+    ).apply { gravity = Gravity.TOP or Gravity.START; this.x = x; this.y = y }
 
-    // ─── Touch Handling ───────────────────────────────────────────────────────
-
-    private fun setupTouchListener(params: WindowManager.LayoutParams) {
-        floatingBinding.root.setOnTouchListener { _, event ->
-            when (event.action) {
+    // ── Touch ─────────────────────────────────────────────────────────────────
+    private fun setupTouch(params: WindowManager.LayoutParams) {
+        floatingBinding.root.setOnTouchListener { _, ev ->
+            when (ev.action) {
                 MotionEvent.ACTION_DOWN -> {
-                    initialX = params.x; initialY = params.y
-                    initialTouchX = event.rawX; initialTouchY = event.rawY
+                    initX = params.x; initY = params.y
+                    initTX = ev.rawX; initTY = ev.rawY
                     isDragging = false
-
-                    longPressRunnable = Runnable { onLongPress() }
-                    longPressHandler.postDelayed(longPressRunnable!!, 700L)
+                    lpRunnable = Runnable { onLongPress() }
+                    lpHandler.postDelayed(lpRunnable!!, 700L)
                     true
                 }
-
                 MotionEvent.ACTION_MOVE -> {
-                    val dx = (event.rawX - initialTouchX).toInt()
-                    val dy = (event.rawY - initialTouchY).toInt()
-
-                    if (!isDragging && (Math.abs(dx) > 8 || Math.abs(dy) > 8)) {
-                        isDragging = true
-                        cancelLongPress()
+                    val dx = (ev.rawX - initTX).toInt()
+                    val dy = (ev.rawY - initTY).toInt()
+                    if (!isDragging && (kotlin.math.abs(dx) > 8 || kotlin.math.abs(dy) > 8)) {
+                        isDragging = true; cancelLp()
                     }
-
                     if (isDragging) {
-                        params.x = initialX + dx
-                        params.y = initialY + dy
+                        params.x = initX + dx; params.y = initY + dy
                         runCatching { windowManager.updateViewLayout(floatingBinding.root, params) }
                     }
                     true
                 }
-
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                    cancelLongPress()
-                    if (!isDragging) onFloatingClick()
+                    cancelLp()
+                    if (!isDragging) onFabClick()
                     true
                 }
-
                 else -> false
             }
         }
     }
 
-    private fun cancelLongPress() {
-        longPressRunnable?.let { longPressHandler.removeCallbacks(it) }
-    }
+    private fun cancelLp() { lpRunnable?.let { lpHandler.removeCallbacks(it) } }
 
     private fun onLongPress() {
-        // Long press → dismiss floating button
-        floatingBinding.root.animate()
-            .scaleX(0f).scaleY(0f).alpha(0f)
-            .setDuration(250)
-            .setInterpolator(DecelerateInterpolator())
-            .withEndAction { stopSelf() }
-            .start()
         vibrate()
+        floatingBinding.root.animate()
+            .scaleX(0f).scaleY(0f).alpha(0f).setDuration(250)
+            .withEndAction { stopSelf() }.start()
     }
 
-    // ─── Click Handling ───────────────────────────────────────────────────────
-
-    private fun onFloatingClick() {
-        if (captureManager == null) {
-            showToast("Service not ready. Restart app.")
-            return
+    // ── FAB Click ─────────────────────────────────────────────────────────────
+    private fun onFabClick() {
+        if (!projectionReady) {
+            showToast("⏳ Waiting for screen permission..."); return
         }
-
         if (isRealtimeMode) {
             if (realtimeJob?.isActive == true) stopRealtime() else startRealtime()
         } else {
-            captureAndProcess()
+            doSingleCapture()
         }
     }
 
-    // ─── Single Capture ───────────────────────────────────────────────────────
-
-    private fun captureAndProcess() {
+    // ── Single Capture ────────────────────────────────────────────────────────
+    private fun doSingleCapture() {
         serviceScope.launch {
-            setButtonCapturing(true)
+            setButtonEnabled(false)
+            floatingBinding.root.visibility = View.INVISIBLE
+            removeResultCard()
+            delay(220)
 
             try {
-                // Hide overlay so it doesn't appear in screenshot
-                floatingBinding.root.visibility = View.INVISIBLE
-                removeResultCard()
-                delay(220) // Wait for frame refresh
-
-                val bitmap = withContext(Dispatchers.IO) { captureManager!!.capture() }
-
+                val bmp = withContext(Dispatchers.IO) { captureManager!!.capture() }
                 floatingBinding.root.visibility = View.VISIBLE
-                setButtonCapturing(false)
+                setButtonEnabled(true)
 
-                if (bitmap == null) { showToast("Capture failed"); return@launch }
+                if (bmp == null) { showToast("Capture failed — try again"); return@launch }
 
-                val cropped = withContext(Dispatchers.Default) {
-                    imageProcessor.cropBottomRight(bitmap)
-                }
-                val inputImage = withContext(Dispatchers.Default) {
-                    imageProcessor.toInputImage(cropped)
-                }
+                val cropped = withContext(Dispatchers.Default) { imageProcessor.cropBottomRight(bmp) }
+                val img     = withContext(Dispatchers.Default) { imageProcessor.toInputImage(cropped) }
+                val rawText = ocrRepository.recognizeText(img)
+                val result  = TextParser.extractCoordinates(rawText)
 
-                val rawText = ocrRepository.recognizeText(inputImage)
-                val result = TextParser.extractCoordinates(rawText)
+                bmp.recycle(); cropped.recycle()
 
-                bitmap.recycle()
-                cropped.recycle()
-
-                if (result != null) {
+                if (result != null)
                     showResultCard(rawText, result.rawMatch, result.formatted, result.latitude, result.longitude)
-                } else {
+                else
                     showToast("⚠️ No coordinates found in bottom-right area")
-                }
 
             } catch (e: Exception) {
                 floatingBinding.root.visibility = View.VISIBLE
-                setButtonCapturing(false)
+                setButtonEnabled(true)
                 showToast("Error: ${e.message}")
             }
         }
     }
 
-    // ─── Real-time Mode ───────────────────────────────────────────────────────
-
+    // ── Real-time Mode ────────────────────────────────────────────────────────
     private fun startRealtime() {
         floatingBinding.btnFloat.setImageResource(R.drawable.ic_stop)
         lastCoordResult = ""
-
         realtimeJob = serviceScope.launch(Dispatchers.IO) {
             while (isActive) {
                 try {
-                    floatingBinding.root.post {
-                        floatingBinding.root.visibility = View.INVISIBLE
-                    }
+                    withContext(Dispatchers.Main) { floatingBinding.root.visibility = View.INVISIBLE }
                     delay(180)
+                    val bmp = captureManager!!.capture()
+                    withContext(Dispatchers.Main) { floatingBinding.root.visibility = View.VISIBLE }
 
-                    val bitmap = captureManager!!.capture()
-
-                    floatingBinding.root.post {
-                        floatingBinding.root.visibility = View.VISIBLE
-                    }
-
-                    if (bitmap != null) {
-                        val cropped = imageProcessor.cropBottomRight(bitmap)
-                        val inputImage = imageProcessor.toInputImage(cropped)
-                        val rawText = ocrRepository.recognizeText(inputImage)
-                        val result = TextParser.extractCoordinates(rawText)
-                        bitmap.recycle(); cropped.recycle()
+                    if (bmp != null) {
+                        val cropped = imageProcessor.cropBottomRight(bmp)
+                        val rawText = ocrRepository.recognizeText(imageProcessor.toInputImage(cropped))
+                        val result  = TextParser.extractCoordinates(rawText)
+                        bmp.recycle(); cropped.recycle()
 
                         if (result != null && result.formatted != lastCoordResult) {
                             lastCoordResult = result.formatted
@@ -294,66 +265,41 @@ class FloatingService : Service() {
                             }
                         }
                     }
-
-                    delay(1200) // 1.2s throttle
-                } catch (e: CancellationException) {
-                    break
-                } catch (e: Exception) {
-                    delay(2000)
-                }
+                    delay(1200)
+                } catch (e: CancellationException) { break }
+                  catch (_: Exception) { delay(2000) }
             }
         }
     }
 
     private fun stopRealtime() {
-        realtimeJob?.cancel()
-        realtimeJob = null
+        realtimeJob?.cancel(); realtimeJob = null
         floatingBinding.btnFloat.setImageResource(R.drawable.ic_gps)
     }
 
-    // ─── Result Card ──────────────────────────────────────────────────────────
-
-    private fun showResultCard(
-        rawOcr: String, matchedText: String, coordinates: String,
-        latitude: Double, longitude: Double
-    ) {
+    // ── Result Card ───────────────────────────────────────────────────────────
+    private fun showResultCard(raw: String, matched: String, coords: String, lat: Double, lon: Double) {
         removeResultCard()
+        val b = OverlayResultCardBinding.inflate(LayoutInflater.from(this))
+        resultBinding = b
 
-        val binding = OverlayResultCardBinding.inflate(LayoutInflater.from(this))
-        resultBinding = binding
+        b.tvRawText.text     = raw.trim().take(200)
+        b.tvMatchedText.text = matched
+        b.tvCoordinates.text = coords
 
-        // Populate data
-        binding.tvRawText.text = rawOcr.trim().take(200)
-        binding.tvMatchedText.text = matchedText
-        binding.tvCoordinates.text = coordinates
-
-        // Copy button
-        binding.btnCopy.setOnClickListener {
-            val clipboard = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
-            clipboard.setPrimaryClip(ClipData.newPlainText("coordinates", coordinates))
-            binding.btnCopy.text = "✓ Copied!"
-            Handler(Looper.getMainLooper()).postDelayed({
-                binding.btnCopy.text = "Copy"
-            }, 2000)
+        b.btnCopy.setOnClickListener {
+            (getSystemService(CLIPBOARD_SERVICE) as ClipboardManager)
+                .setPrimaryClip(ClipData.newPlainText("coordinates", coords))
+            b.btnCopy.text = "✓ Copied!"
+            Handler(Looper.getMainLooper()).postDelayed({ b.btnCopy.text = "Copy" }, 2000)
         }
-
-        // Google Maps button
-        binding.btnMaps.setOnClickListener {
-            val uri = Uri.parse("geo:$latitude,$longitude?q=$latitude,$longitude(Location)")
-            val intent = Intent(Intent.ACTION_VIEW, uri).apply {
-                flags = Intent.FLAG_ACTIVITY_NEW_TASK
-            }
-            try {
-                startActivity(intent)
-            } catch (e: Exception) {
-                showToast("Maps app not found")
-            }
+        b.btnMaps.setOnClickListener {
+            val uri = Uri.parse("geo:$lat,$lon?q=$lat,$lon(Location)")
+            runCatching { startActivity(Intent(Intent.ACTION_VIEW, uri).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
+                .onFailure { showToast("Maps app not found") }
         }
+        b.btnClose.setOnClickListener { removeResultCard() }
 
-        // Close button
-        binding.btnClose.setOnClickListener { removeResultCard() }
-
-        // Window params (interactive overlay at bottom)
         val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -363,14 +309,11 @@ class FloatingService : Service() {
             PixelFormat.TRANSLUCENT
         ).apply { gravity = Gravity.BOTTOM; y = 80 }
 
-        windowManager.addView(binding.root, params)
-
-        // Slide-up animation
-        binding.root.apply {
+        windowManager.addView(b.root, params)
+        b.root.apply {
             alpha = 0f; translationY = 120f
             animate().alpha(1f).translationY(0f)
-                .setDuration(320).setInterpolator(DecelerateInterpolator(1.5f))
-                .start()
+                .setDuration(320).setInterpolator(DecelerateInterpolator(1.5f)).start()
         }
     }
 
@@ -378,69 +321,52 @@ class FloatingService : Service() {
         resultBinding?.let { b ->
             runCatching {
                 b.root.animate().alpha(0f).translationY(80f).setDuration(200)
-                    .withEndAction { runCatching { windowManager.removeView(b.root) } }
-                    .start()
+                    .withEndAction { runCatching { windowManager.removeView(b.root) } }.start()
             }
             resultBinding = null
         }
     }
 
-    // ─── UI Helpers ───────────────────────────────────────────────────────────
-
-    private fun setButtonCapturing(capturing: Boolean) {
+    // ── Helpers ───────────────────────────────────────────────────────────────
+    private fun setButtonEnabled(enabled: Boolean) {
         floatingBinding.btnFloat.apply {
-            isEnabled = !capturing
-            alpha = if (capturing) 0.5f else 1.0f
+            isEnabled = enabled
+            alpha = if (enabled) 1f else 0.45f
         }
     }
 
-    private fun showToast(msg: String) {
-        Handler(Looper.getMainLooper()).post {
-            Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
-        }
-    }
+    private fun showToast(msg: String) =
+        Handler(Looper.getMainLooper()).post { Toast.makeText(this, msg, Toast.LENGTH_SHORT).show() }
 
     private fun vibrate() {
-        val vibrator = getSystemService(VIBRATOR_SERVICE) as Vibrator
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            vibrator.vibrate(VibrationEffect.createOneShot(60, VibrationEffect.DEFAULT_AMPLITUDE))
-        } else {
-            @Suppress("DEPRECATION")
-            vibrator.vibrate(60)
-        }
+        val v = getSystemService(VIBRATOR_SERVICE) as Vibrator
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+            v.vibrate(VibrationEffect.createOneShot(60, VibrationEffect.DEFAULT_AMPLITUDE))
+        else @Suppress("DEPRECATION") v.vibrate(60)
     }
 
-    // ─── Notification ─────────────────────────────────────────────────────────
-
+    // ── Notification ──────────────────────────────────────────────────────────
     private fun createNotificationChannel() {
-        val channel = NotificationChannel(
-            CHANNEL_ID,
-            "CoordExtractor Overlay",
-            NotificationManager.IMPORTANCE_LOW
-        ).apply {
+        val ch = NotificationChannel(CHANNEL_ID, "CoordExtractor Overlay",
+            NotificationManager.IMPORTANCE_LOW).apply {
             description = "Floating coordinate extractor"
             setShowBadge(false)
         }
-        (getSystemService(NOTIFICATION_SERVICE) as NotificationManager)
-            .createNotificationChannel(channel)
+        (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(ch)
     }
 
     private fun buildNotification(): Notification {
-        val tapIntent = PendingIntent.getActivity(
-            this, 0, Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_IMMUTABLE
-        )
-        val stopIntent = PendingIntent.getService(
-            this, 1, Intent(this, FloatingService::class.java).apply { action = "STOP" },
-            PendingIntent.FLAG_IMMUTABLE
-        )
-
+        val tap = PendingIntent.getActivity(this, 0,
+            Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+        val stop = PendingIntent.getService(this, 1,
+            Intent(this, FloatingService::class.java).apply { action = "STOP" },
+            PendingIntent.FLAG_IMMUTABLE)
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("CoordExtractor Active")
             .setContentText("Tap floating button to extract coordinates")
             .setSmallIcon(R.drawable.ic_gps)
-            .setContentIntent(tapIntent)
-            .addAction(R.drawable.ic_close, "Stop", stopIntent)
+            .setContentIntent(tap)
+            .addAction(R.drawable.ic_close, "Stop", stop)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
