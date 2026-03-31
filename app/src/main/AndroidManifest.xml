@@ -1,14 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- Overlay permission: draw over other apps -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
-
-    <!-- Foreground service permission -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-
-    <!-- Android 14+ requires specific foreground service type -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <uses-permission android:name="android.permission.VIBRATE" />
 
     <application
         android:allowBackup="true"
@@ -18,7 +14,6 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.CoordExtractor">
 
-        <!-- Main Activity -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -30,7 +25,11 @@
             </intent-filter>
         </activity>
 
-        <!-- Floating Overlay Foreground Service -->
+        <!--
+            CRITICAL FIX (Android 14):
+            foregroundServiceType="mediaProjection" MUST be declared here.
+            Service ko MediaProjection request se PEHLE start karna padega.
+        -->
         <service
             android:name=".service.FloatingService"
             android:foregroundServiceType="mediaProjection"
